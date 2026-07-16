@@ -69,6 +69,46 @@ class LoggingSettings(BaseSettings):
     )
 
 
+class KiteSettings(BaseSettings):
+    """Zerodha Kite Connect credentials and session configuration.
+
+    All values are optional at the field level because the *presence* of
+    credentials is a runtime concern validated by the market-data provider
+    (see `KiteMarketDataProvider._validate_credentials`), not a config-parsing
+    concern. This keeps Pydantic focused on shape/type validation while
+    domain-specific rules (e.g. "api_key is required to authenticate") live
+    in the layer that owns that rule.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="KITE_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    api_key: SecretStr | None = Field(
+        default=None, description="Kite Connect API key issued by Zerodha."
+    )
+    api_secret: SecretStr | None = Field(
+        default=None, description="Kite Connect API secret issued by Zerodha."
+    )
+    access_token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Cached access token from a previously completed login session. "
+            "If set, the provider can skip the interactive login flow."
+        ),
+    )
+    redirect_url: str | None = Field(
+        default=None,
+        description="OAuth redirect URL registered with Kite Connect (optional).",
+    )
+    request_timeout: int = Field(
+        default=7, ge=1, description="Seconds to wait for Kite API responses."
+    )
+
+
 class Settings(BaseSettings):
     """Top-level application settings.
 
@@ -103,6 +143,7 @@ class Settings(BaseSettings):
     # --- Sub-settings --------------------------------------------------------
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    kite: KiteSettings = Field(default_factory=KiteSettings)
 
     @field_validator("environment", mode="before")
     @classmethod

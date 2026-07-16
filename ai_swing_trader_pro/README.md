@@ -2,9 +2,11 @@
 
 An AI-assisted swing trading platform, built with **Clean Architecture** and **SOLID** principles.
 
-> **Sprint 2** — this release lays the architectural foundation: configuration, logging,
-> and database plumbing. **No Kite Connect integration or trading logic is implemented yet.**
-> That arrives in a future sprint.
+> **Sprint 2** laid the architectural foundation: configuration, logging, and database plumbing.
+> **Sprint 3.1** (this release) adds the **Kite Connect authentication layer** — a
+> `MarketDataProvider` interface and its Kite implementation, covering login/session setup and
+> connection verification only. **Instrument download, historical data, live quotes, strategy
+> logic, and the scanner are still not implemented.**
 
 ---
 
@@ -17,6 +19,7 @@ An AI-assisted swing trading platform, built with **Clean Architecture** and **S
 - [Configuration](#configuration)
 - [Running the App](#running-the-app)
 - [Running Tests](#running-tests)
+- [Kite Connect Authentication (Sprint 3.1)](#kite-connect-authentication-sprint-31)
 - [Design Principles](#design-principles)
 - [Roadmap](#roadmap)
 
@@ -71,26 +74,36 @@ ai_swing_trader_pro/
 │       │   ├── logger.py            # Loguru configuration
 │       │   └── exceptions.py        # shared exception hierarchy
 │       ├── domain/
-│       │   ├── __init__.py          # (placeholder — Sprint 3+)
-│       │   └── entities/
-│       │       └── __init__.py
+│       │   ├── __init__.py          # (entities placeholder — Sprint 3.2+)
+│       │   ├── exceptions.py        # market-data-provider exception hierarchy
+│       │   ├── entities/
+│       │   │   └── __init__.py
+│       │   └── interfaces/
+│       │       ├── __init__.py
+│       │       └── market_data_provider.py   # abstract MarketDataProvider port
 │       ├── application/
-│       │   └── __init__.py          # (placeholder — Sprint 3+)
+│       │   └── __init__.py          # (placeholder — Sprint 3.2+)
 │       ├── infrastructure/
 │       │   ├── __init__.py
-│       │   └── database/
+│       │   ├── database/
+│       │   │   ├── __init__.py
+│       │   │   ├── base.py          # declarative Base + naming convention
+│       │   │   └── session.py       # engine, sessionmaker, session_scope
+│       │   └── market_data/
 │       │       ├── __init__.py
-│       │       ├── base.py          # declarative Base + naming convention
-│       │       └── session.py       # engine, sessionmaker, session_scope
+│       │       ├── kite_client.py   # thin wrapper around the kiteconnect SDK
+│       │       └── kite_provider.py # KiteMarketDataProvider (auth + verification)
 │       └── interfaces/
-│           └── __init__.py          # (placeholder — Sprint 3+, e.g. Kite Connect)
+│           └── __init__.py          # (placeholder — Sprint 3.2+, e.g. CLI/API)
 └── tests/
     ├── __init__.py
     ├── conftest.py                  # shared fixtures (isolated settings/DB)
     ├── test_config.py
     ├── test_logger.py
     ├── test_database.py
-    └── test_main.py
+    ├── test_main.py
+    ├── test_kite_client.py
+    └── test_kite_provider.py
 ```
 
 ---
@@ -109,6 +122,7 @@ Runtime dependencies (declared in `pyproject.toml`):
 | `loguru`            | Structured, rotating application logging   |
 | `sqlalchemy`        | ORM / database engine & session management |
 | `python-dotenv`     | `.env` file loading support                |
+| `kiteconnect`       | Official Zerodha Kite Connect SDK          |
 
 Dev dependencies: `pytest`, `pytest-cov`, `mypy`, `ruff`.
 
@@ -151,6 +165,11 @@ loaded from `.env` at the project root. See `.env.example` for the full list of 
 | `LOG_DIRECTORY`   | `./logs`                                 | Where rotating log files are written  |
 | `LOG_ROTATION`    | `10 MB`                                  | Rotation policy                       |
 | `LOG_RETENTION`   | `14 days`                                | How long rotated logs are kept        |
+| `KITE_API_KEY`    | *(none)*                                 | Kite Connect API key (**required** to authenticate) |
+| `KITE_API_SECRET` | *(none)*                                 | Kite Connect API secret (**required** to authenticate) |
+| `KITE_ACCESS_TOKEN` | *(none)*                               | Optional cached access token (skips interactive login; expires daily) |
+| `KITE_REDIRECT_URL` | *(none)*                               | OAuth redirect URL registered with Kite Connect (optional) |
+| `KITE_REQUEST_TIMEOUT` | `7`                                  | Seconds to wait for Kite API responses |
 
 Access settings anywhere via:
 
@@ -199,6 +218,53 @@ mypy .
 
 ---
 
+## Kite Connect Authentication (Sprint 3.1)
+
+This sprint adds the broker authentication layer, following the same dependency-inversion
+pattern used for the database in Sprint 2:
+
+- **`domain/interfaces/market_data_provider.py`** — an abstract `MarketDataProvider` port
+  (`get_login_url`, `authenticate`, `verify_connection`, `is_authenticated`). Pure standard
+  library; no broker SDK dependency.
+- **`domain/exceptions.py`** — `InvalidCredentialsError`, `AuthenticationError`,
+  `SessionNotInitializedError`, `ConnectionVerificationError` — all rooted in `AppError`, so
+  broker-SDK-specific exceptions never leak past the infrastructure layer.
+- **`infrastructure/market_data/kite_client.py`** — a thin, dependency-injectable wrapper
+  around `kiteconnect.KiteConnect`. Knows nothing about domain exceptions or logging.
+- **`infrastructure/market_data/kite_provider.py`** — `KiteMarketDataProvider`, the concrete
+  `MarketDataProvider` implementation. Validates credentials, translates SDK errors into domain
+  exceptions, and logs every authentication step via Loguru.
+
+### Authentication flow
+
+Kite Connect uses a request-token OAuth-style flow:
+
+```python
+from ai_swing_trader_pro.infrastructure.market_data import KiteMarketDataProvider
+
+provider = KiteMarketDataProvider()  # raises InvalidCredentialsError if KITE_API_KEY/SECRET are missing
+
+# 1. Send the user to Kite's login page:
+login_url = provider.get_login_url()
+
+# 2. After login, Kite redirects back with a `request_token` query param.
+#    Exchange it for an access token:
+provider.authenticate(request_token="the-request-token-from-the-redirect")
+
+# 3. Confirm the session is actually usable against the live API:
+assert provider.verify_connection() is True
+```
+
+If `KITE_ACCESS_TOKEN` is already set in `.env` (e.g. from an earlier session the same day),
+`provider.authenticate()` can be called with no arguments and will reuse it — Kite access
+tokens are valid until the next trading day's reset, so this only works within that window.
+
+**Out of scope for Sprint 3.1** (by design): instrument download, historical candle data,
+live quotes, strategy logic, and the scanner. These build on top of this authentication layer
+in later sprints.
+
+---
+
 ## Design Principles
 
 - **Single Responsibility** — `config.py` only loads config, `logger.py` only configures logging,
@@ -209,23 +275,27 @@ mypy .
   for any future entity.
 - **Interface Segregation** — `base.py` and `session.py` are split so model modules don't need to
   import engine/session machinery.
-- **Dependency Inversion** — higher layers (`domain`, `application`) will depend on abstractions,
-  not on SQLAlchemy or broker SDKs directly.
+- **Dependency Inversion** — higher layers (`domain`, `application`) depend on abstractions
+  (`MarketDataProvider`), not on SQLAlchemy or the `kiteconnect` SDK directly.
+- **Testability via injection** — both `KiteClient` (via `sdk_client=`) and
+  `KiteMarketDataProvider` (via `client=`) accept their collaborators as constructor
+  arguments, so unit tests substitute mocks without touching real credentials or the network.
 
 ---
 
 ## Roadmap
 
-| Sprint | Scope                                                              |
-|--------|----------------------------------------------------------------------|
-| 1      | Project ideation & requirements                                      |
-| **2**  | **Clean architecture scaffold, config, logging, DB setup (this repo)** |
-| 3      | Domain entities (Instrument, Order, Position) + ORM models            |
-| 4      | Kite Connect integration                                              |
-| 5      | Trading strategy engine                                               |
-| 6      | Backtesting & AI signal generation                                    |
+| Sprint   | Scope                                                              |
+|----------|----------------------------------------------------------------------|
+| 1        | Project ideation & requirements                                      |
+| 2        | Clean architecture scaffold, config, logging, DB setup                |
+| **3.1**  | **Kite Connect authentication layer (this repo)**                     |
+| 3.2      | Domain entities (Instrument, Order, Position) + ORM models             |
+| 3.3      | Instrument download, historical data, live quotes                      |
+| 4        | Trading strategy engine + scanner                                      |
+| 5        | Backtesting & AI signal generation                                     |
 
 ---
 
-*This README documents Sprint 2 only. Trading functionality, broker integration, and
-strategy logic are intentionally out of scope until later sprints.*
+*This README documents Sprints 2 and 3.1. Instrument download, historical data, live quotes,
+strategy logic, and the scanner are intentionally out of scope until later sprints.*
